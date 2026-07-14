@@ -422,6 +422,13 @@ class ModelView(BaseModelView):
         else:
             self._auto_joins = self.column_select_related_list
 
+        # Merge in eager-load targets discovered by
+        # scaffold_relationship_links() (column_relationship_links), so
+        # auto-linked relationship columns don't cause N+1 queries.
+        link_joins = getattr(self, "_relationship_link_joins", None)
+        if link_joins:
+            self._auto_joins = list(set(self._auto_joins) | link_joins)
+
     # Internal API
     def _get_model_iterator(
         self, model: type[T_SQLALCHEMY_MODEL] | None = None
@@ -980,6 +987,125 @@ class ModelView(BaseModelView):
                 joined.append(getattr(self.model, prop))  # type: ignore[arg-type]
 
         return joined
+
+    def scaffold_relationship_links(self) -> None:
+        """
+        Auto-populate ``column_formatters`` for relationship columns listed
+        in ``column_list``, turning them into links to the related model's
+        registered ``ModelView``.
+
+        Driven by ``column_relationship_links``:
+
+        * ``True``  -> auto-detect every relationship column and link it to
+          the endpoint matching the related model's class name (lowercased),
+          i.e. whatever ``admin.add_view(ModelView(RelatedModel, ...))``
+          registered by default.
+        * ``dict``  -> only the given relationship names are linked, each to
+          its explicit endpoint value.
+
+        Columns that already have an entry in ``column_formatters`` are
+        left alone, so explicit user formatters always win. Relationships
+        that get auto-linked are also added to ``_auto_joins`` so
+        ``get_list`` eager-loads them and avoids per-row N+1 queries.
+        """
+        from flask import url_for
+        from markupsafe import Markup
+        from markupsafe import escape
+        from werkzeug.routing import BuildError
+
+        overrides = (
+            self.column_relationship_links
+            if isinstance(self.column_relationship_links, dict)
+            else {}
+        )
+
+        # NOTE: this runs from the base class's _refresh_cache(), which
+        # fires from *inside* super().__init__() -- before this class's
+        # own __init__ has set self._auto_joins (see below). Collect join
+        # targets into a side list and merge them in once _auto_joins
+        # actually exists.
+        auto_join_targets: set[t.Any] = set(
+            getattr(self, "_relationship_link_joins", set())
+        )
+
+        for prop, _name in self._list_columns:
+            if prop in self.column_formatters:
+                continue
+
+            attr = getattr(self.model, prop, None)
+            if attr is None or not is_relationship(attr):
+                continue
+
+            related_cls = attr.property.mapper.class_
+            endpoint = overrides.get(prop) or related_cls.__name__.lower()
+            uselist = attr.property.uselist
+
+            def _make_formatter(
+                endpoint: str = endpoint, uselist: bool = uselist
+            ) -> t.Callable[..., t.Any]:
+                def _formatter(
+                    view: "ModelView",
+                    context: t.Any,
+                    model: t.Any,
+                    name: str,
+                ) -> t.Any:
+                    value = getattr(model, name)
+                    if value is None:
+                        return ""
+
+                    targets = value if uselist else [value]
+                    links = []
+                    for target in targets:
+                        try:
+                            target_pk = view.model_pk_for(target)
+                        except Exception:
+                            target_pk = getattr(target, "id", None)
+                        try:
+                            url = url_for(f"{endpoint}.edit_view", id=target_pk)
+                        except BuildError:
+                            try:
+                                url = url_for(
+                                    f"{endpoint}.details_view", id=target_pk
+                                )
+                            except BuildError:
+                                # No registered admin view for the related
+                                # model -- fall back to plain text so this
+                                # never breaks the list page.
+                                links.append(escape(str(target)))
+                                continue
+                        links.append(
+                            f'<a href="{url}">{escape(str(target))}</a>'
+                        )
+
+                    return Markup(", ".join(links))
+
+                return _formatter
+
+            self.column_formatters[prop] = _make_formatter()
+            auto_join_targets.add(attr)
+
+        self._relationship_link_joins = auto_join_targets
+
+    def model_pk_for(self, model: t.Any) -> t.Any:
+        """
+        Return the primary key value for an arbitrary model instance,
+        using this view's own ``get_pk_value`` if the instance belongs to
+        ``self.model``, otherwise falling back to SQLAlchemy inspection.
+        """
+        if isinstance(model, self.model):
+            return self.get_pk_value(model)
+
+        from sqlalchemy import inspect as sa_inspect
+
+        state = sa_inspect(model)
+        pk_values = state.identity
+        if pk_values is None:
+            # Transient/unflushed instance -- try mapper's PK columns
+            mapper = state.mapper
+            pk_values = tuple(
+                getattr(model, c.key) for c in mapper.primary_key
+            )
+        return pk_values[0] if len(pk_values) == 1 else pk_values
 
     # AJAX foreignkey support
     def _create_ajax_loader(

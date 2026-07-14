@@ -358,6 +358,30 @@ class BaseModelView(BaseView, ActionsMixin):
         that macros are not supported.
     """
 
+    column_relationship_links: t.Union[bool, dict] = False
+    """
+        Controls automatic hyperlinking of relationship columns in the list view.
+
+        When ``True``, every relationship column present in ``column_list``
+        is automatically rendered as a link (or comma-separated links, for
+        collections) pointing at the registered ``ModelView`` for the related
+        model's edit page (or details page if ``can_view_details`` is set on
+        that view and no edit permission is available).
+
+        Can also be a dict mapping relationship names to an explicit
+        endpoint name, to override auto-detection for specific columns::
+
+            class MyModelView(ModelView):
+                column_relationship_links = {'discount_code': 'discountcode'}
+
+        Columns already present in ``column_formatters`` are left untouched;
+        this feature only fills in relationships that don't already have an
+        explicit formatter, so it never overrides custom formatting.
+
+        Only supported by backends that know how to introspect relationships
+        (currently ``flask_admin.contrib.sqla``). Defaults to ``False``.
+    """
+
     column_type_formatters: T_COLUMN_TYPE_FORMATTERS | None = t.cast(
         None, ObsoleteAttr("column_type_formatters", "list_type_formatters", None)
     )
@@ -1097,6 +1121,11 @@ class BaseModelView(BaseView, ActionsMixin):
         if self.column_formatters_detail is None:
             self.column_formatters_detail = self.column_formatters
 
+        # Relationship links (no-op unless overridden by a backend
+        # that can introspect relationships, e.g. contrib.sqla)
+        if self.column_relationship_links:
+            self.scaffold_relationship_links()
+
         # Type formatters
         if self.column_type_formatters is None:
             self.column_type_formatters = dict(typefmt.BASE_FORMATTERS)
@@ -1126,6 +1155,16 @@ class BaseModelView(BaseView, ActionsMixin):
         Return PK value from a model object.
         """
         raise NotImplementedError()
+
+    def scaffold_relationship_links(self) -> None:
+        """
+        Populate ``column_formatters`` with auto-generated link formatters
+        for relationship columns, based on ``column_relationship_links``.
+
+        No-op by default. Backends capable of introspecting relationships
+        (e.g. ``flask_admin.contrib.sqla.ModelView``) override this.
+        """
+        pass
 
     # List view
     def scaffold_list_columns(self) -> list[str]:
